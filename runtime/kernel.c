@@ -575,6 +575,30 @@ static void hle_ctrl_support(CPU* RESTRICT c, u64 entry){ (void)entry;
 static void hle_ctrl_other(CPU* RESTRICT c, u64 entry){ (void)entry; c->x[0]=0; c->pc=c->x[30];
   static int said; if(!said){ said=1; LOG("hid: controller applet call answered by the runtime (ok)\n"); } }
 
+/* Switch 2 SDK's SystemEvent wrapper asserts when a service-backed event has
+   no native SystemEventType storage.  The service side still owns and signals
+   the kernel event; keep this thin wrapper from aborting while the runtime
+   completes that hand-off. */
+static void hle_wait_system_event(CPU* RESTRICT c, u64 entry){ (void)entry;
+  c->x[0]=0; c->pc=c->x[30];
+  static int said; if(!said++){ LOG("hle: WaitSystemEvent completed through the runtime event bridge\n"); }
+}
+
+static void hle_wsi_present(CPU* RESTRICT c, u64 entry){ (void)entry;
+  extern void ns2_native_present(u32 slot);
+  ns2_native_present((u32)c->x[1]);
+  c->x[0]=0; c->pc=c->x[30];
+  static int said; if(!said++){ LOG("hle: Ounce NativeWindow::Present completed through vi2\n"); }
+}
+
+static void hle_wsi_acquire(CPU* RESTRICT c, u64 entry){ (void)entry;
+  /* Acquire's first output is the swapchain slot.  The NVN shim owns the
+     actual pacing; return slot zero here so the SDK's wrapper can continue. */
+  if(c->x[1]>=AS_BASE && c->x[1]+4<AS_SIZE) gw32(c->x[1],0);
+  c->x[0]=0; c->pc=c->x[30];
+  static int said; if(!said++){ LOG("hle: Ounce NativeWindow::Acquire completed through NVN\n"); }
+}
+
 /* sead::ExpHeap only works from one thread at a time unless the game turns its lock on. on the switch the threads
    sharing one of those heaps sit on the same core and never run at once, here they do: odyssey's archive loader and
    HakoniwaSequence::initSystem broke the free list on PCs with many cores and the game halted in ExpHeap::tryAlloc.
@@ -699,6 +723,12 @@ void hle_install(void){
     int with_info= strstr(nm,"ShowControllerSupport") && strstr(nm,"ControllerSupportResultInfo");
     g_disp[(a-g_code_lo)/4]= with_info? hle_ctrl_support : hle_ctrl_other; n++;
     LOG("hle: %s at %llx\n",nm,(unsigned long long)a); }
+  { const char* nm="_ZN2nn2os15WaitSystemEventEPNS0_15SystemEventTypeE"; u64 a=gsym_find(nm);
+    if(a>=g_code_lo && a<g_code_hi && !(a&3)){ g_disp[(a-g_code_lo)/4]=hle_wait_system_event; LOG("hle: %s at %llx\n",nm,(unsigned long long)a); } }
+  { const char* nm="_ZN2nn3wsi5ounce6native12NativeWindow7PresentEjRKNS_2gs16NativeSyncHandleE"; u64 a=gsym_find(nm);
+    if(a>=g_code_lo && a<g_code_hi && !(a&3)){ g_disp[(a-g_code_lo)/4]=hle_wsi_present; LOG("hle: %s at %llx\n",nm,(unsigned long long)a); } }
+  { const char* nm="_ZN2nn3wsi5ounce6native12NativeWindow7AcquireEPjPNS_2gs16NativeSyncHandleE"; u64 a=gsym_find(nm);
+    if(a>=g_code_lo && a<g_code_hi && !(a&3)){ g_disp[(a-g_code_lo)/4]=hle_wsi_acquire; LOG("hle: %s at %llx\n",nm,(unsigned long long)a); } }
   if(g_nhl) LOG("hle: %d sead::ExpHeap functions run under one lock (threads that share a core on the switch run at once here)\n",g_nhl);
   (void)n; }
 

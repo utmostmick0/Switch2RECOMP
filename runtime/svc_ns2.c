@@ -74,6 +74,27 @@ static int g_gpu_ctx, g_gpu_ready, g_frame_ctx, g_img_ctx, g_img_formats, g_disp
 static int native_mem_has(u32 id){ for(u32 i=0;i<g_nnative;i++) if(g_native_mem[i]==id) return 1; return 0; }
 static NsImage* image_find(u32 id){ for(u32 i=0;i<g_nimg;i++) if(g_img[i].id==id) return &g_img[i]; return NULL; }
 
+/* Ounce's NativeWindow::Present path is not an IPC call: the guest wrapper calls the
+   native vi2 backend directly after OnPresentTexture.  Keep that path equivalent to
+   vi2 command 229 by presenting the selected native image through the runtime's
+   existing display bridge. */
+void ns2_native_present(u32 slot){
+  NsImage image; memset(&image,0,sizeof image);
+  ns2_lock();
+  u32 n=0, chosen=0;
+  for(u32 i=0;i<g_nimg;i++) if(g_img[i].window_pool){
+    if(n++ == (slot % 16u)) chosen=i;
+  }
+  if(n && chosen<g_nimg) image=g_img[chosen];
+  ns2_unlock();
+  if(!image.id) return;
+  u64 a=nvmap_addr(image.mem); if(!a) return; a+=image.off;
+  u32 w=(image.pref[2]&0xFFFF)+1, h=(image.pref[2]>>16)+1;
+  u32 pitch=image.pref[5]*64;
+  if(!w || !h || !pitch) return;
+  vi_show_addr(a,w,h,pitch,3,image.pref[4]>=3? image.pref[4]-3 : 0,532120);
+}
+
 /* the size of a native image: four-byte color, row pitch in GOBs, block height 2^pref[4] pixels */
 /* a layout image_size doesn't know: a size that's surely big enough (16 bytes a pixel unless the pitch says less, 128
    line blocks, every layer and twice that for mips), so the game gets memory instead of an abort */
@@ -220,12 +241,18 @@ static int gpusess_disp(SvcObj* o, IpcCtx* c){   /* IGpuSession */
       if(!flags) for(u32 i=1;i<256;i++) if(!g_dev.dev_used[i]){ g_dev.dev_used[i]=1; g_dev.dev_name[i]=name; id=i; rc=0; break; }
       out32(c,id); break; }
     case 42: { u32 i=W(c,2)&0xFF; rc= g_dev.dev_used[i]? 0 : K_NOTFOUND; g_dev.dev_used[i]=0; break; }   /* DestroyGraphicsDevice */
-    case 202: case 203: { u32 id=W(c,2); int ok=0; for(int i=0;i<8;i++) if(g_dev.as[i]==(int)id) ok=1;   /* Get{Gsv,User}Partition */
+    /* Eglantine's newer nx2:gsv path uses 201/202 for the user and GSV
+       partitions respectively.  The old 203 VA-range query remains for
+       SDKs that still use it.  These replies are ranges, not nvdrv handles;
+       returning K_NOTIMPL here makes NVN close the device before submitting. */
+    case 201: { u64 first=0x8000000ull, last=0xC000000000ull;
+      LOG("switch 2: GPU user partition %llx-%llx\n",(unsigned long long)first,(unsigned long long)last);
+      out64(c,first); out64(c,last-first); break; }
+    case 202: { out64(c,~0ull); out64(c,0); break; }                  /* empty GSV partition */
+    case 203: { u32 id=W(c,2); int ok=0; for(int i=0;i<8;i++) if(g_dev.as[i]==(int)id) ok=1;
       rc= ok? 0 : K_NOTFOUND;
-      if(c->cmd==202){ out64(c,~0ull); out64(c,0); }
-      else { /* the user partition: from the 4K region's start to the end of the 40 bit space (the 4K region of ioctl_as 0x08) */
-        out64(c,ok? 1 : 0); out64(c,0x04000000); out64(c,0xFFFFFFFFFFull);   /* the whole 40 bit space: NVN reserves 0x8000000..512 GB of it and takes more past that */ for(int k=0;k<6;k++) out64(c,0); }
-      break; }
+      if(ok){ out64(c,1); out64(c,0x04000000); out64(c,0xFFFFFFFFFFull); for(int k=0;k<6;k++) out64(c,0); }
+      else out64(c,0); break; }
     default: ns2_unlock(); return ns2_unknown(o,c);
   }
   ns2_unlock(); return rc; }
@@ -365,7 +392,7 @@ static int gsv_disp(SvcObj* o, IpcCtx* c){
       break; }
     case 429: { u32 id=0; u64 sz=0;                                    /* CreateNativeImage {preference[16], count, memory} */
       u32 p[16]; for(int i=0;i<16;i++) p[i]=W(c,2+i);
-      if(g_phase!=3 || !g_gpu_ready || !g_img_formats) rc=K_INVSTATE;
+      if(g_phase!=3 || !g_gpu_ready) rc=K_INVSTATE;
       else if(!image_size_any(p,W(c,18),&sz,NULL)) rc=K_NOTIMPL;
       else if(!native_mem_has(W(c,19)) || !nvmap_addr(W(c,19))) rc=K_NOTFOUND;
       else if(nvmap_size(W(c,19))<sz) rc=K_INVSIZE; else if(g_nimg>=1024) rc=K_OUTOFRES;
@@ -376,7 +403,9 @@ static int gsv_disp(SvcObj* o, IpcCtx* c){
     case 434: { u32 id=W(c,2); rc= g_gpu_ready? K_NOTFOUND : K_INVSTATE;   /* RegisterGpuAddressSpace */
       if(g_gpu_ready) for(int i=0;i<8;i++) if(g_dev.as[i]==(int)id){ g_dev.as_reg[i]=1; rc=0; } break; }
     case 435: case 1510: { u32 p[16]; for(int i=0;i<16;i++) p[i]=W(c,2+i); u64 sz=0, al=0;   /* CalculateNativeImageSize / ImageRequirements */
-      if(g_phase!=3 || !g_img_formats) rc=K_INVSTATE; else if(!image_size_any(p,W(c,18),&sz,&al)) rc=K_NOTIMPL;
+      /* The window asks for its native image size before the optional image
+         format context is activated, matching Eglantine's gsv 435/1510 path. */
+      if(g_phase!=3) rc=K_INVSTATE; else if(!image_size_any(p,W(c,18),&sz,&al)) rc=K_NOTIMPL;
       { static int said; if(said<sw2_cap(2)){ said++; LOG("switch 2: %s {",cmd==1510? "image requirements" : "native image size"); for(int i=0;i<16;i++) LOG("%s%x",i? " " : "",p[i]); LOG("} count %u -> size %llx align %llx (%x)\n",W(c,18),(unsigned long long)sz,(unsigned long long)al,rc); } }
       out64(c,sz); if(cmd==1510) out64(c,al); break; }
     case 497: if(g_phase!=3){ rc=K_INVSTATE; out_move_h(c,0); break; }       /* OpenGpuSession */

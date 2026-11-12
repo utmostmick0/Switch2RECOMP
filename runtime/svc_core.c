@@ -58,9 +58,22 @@ static u32 ev_handle(KEvent* e){ return h_new(&e->o); }
 /* ================================================================ am */
 static KEvent* g_msg_event; static u32 g_msgq[16]; static int g_nmsg;
 static KEvent* g_launch_ev; static KEvent* g_res_ev; static KEvent* g_opmode_ev;
+/* Eglantine keeps these IApplicationFunctions events as stable kernel objects.  Returning a
+   newly-created event for every query loses the identity that the SDK caches in its multi-wait
+   holders, and is especially visible on Switch 2 during graphics startup. */
+static KEvent* g_appfn_gpu_error;
+static KEvent* g_appfn_friend_channel;
+static KEvent* g_appfn_notification_channel;
+static KEvent* g_appfn_health_warning;
+static KEvent* g_appfn_opmode_refresh;
 static u64 g_user_id[2]={0x0123456789ABCDEFull,0xFEDCBA9876543210ull};
 
 static void am_push_msg(u32 m){ pm_lock(&g_klock); if(g_nmsg<16) g_msgq[g_nmsg++]=m; pm_unlock(&g_klock); kevent_signal(g_msg_event); }
+
+static KEvent* am_appfn_event(KEvent** slot, const char* name){
+  if(!*slot){ *slot=kevent_new(name,0); kobj_ref(&(*slot)->o); }
+  return *slot;
+}
 
 /* IStorage / IStorageAccessor */
 typedef struct { u8* d; u64 size; } StorageData;
@@ -144,13 +157,21 @@ static int am_appfn(SvcObj* o, IpcCtx* c){         /* IApplicationFunctions */
     case 25: out64(c,0); return 0;                                     /* ExtendSaveData */
     case 26: out64(c,0x4000000); out64(c,0x4000000); return 0;       /* GetSaveDataSize */
     case 110: out32(c,0); return 0;
-    case 22: case 27: case 28: case 32: case 33: case 34: case 35: case 36: case 37: case 66: case 67: case 68: case 90: case 100: case 101: case 120: case 124: return 0;
+    case 22: case 27: case 28: case 32: case 33: case 34: case 35: case 36: case 37:
+    case 60: case 61: case 66: case 67: case 68: case 70: case 71: case 72:
+    case 80: case 90: case 100: case 101: case 112: case 113: case 124:
+    case 180: case 181: case 190: case 200: case 220: case 230:
+    case 300: case 310: return 0;
     case 151: return RC(128,2);                                      /* TryPopFromNotificationStorageChannel: nothing queued */
     case 23: { char v[16]="1.0.0"; outbytes(c,v,16); return 0; }         /* GetDisplayVersion */
     case 40: out8(c,0); return 0;                                      /* NotifyRunning */
     case 50: out64(c,0x1111222233334444ull); out64(c,0x5555666677778888ull); return 0;
-    case 60: case 61: return 0;
-    case 130: case 140: case 150: case 160: case 210: out_copy_h(c,ev_handle(kevent_new("appfn ev",0))); return 0;   /* events (210 only exists in newer SDKs) */
+    case 130: out_copy_h(c,ev_handle(am_appfn_event(&g_appfn_gpu_error,"appfn gpu error"))); return 0;
+    case 140: out_copy_h(c,ev_handle(am_appfn_event(&g_appfn_friend_channel,"appfn friend channel"))); return 0;
+    case 150: out_copy_h(c,ev_handle(am_appfn_event(&g_appfn_notification_channel,"appfn notification channel"))); return 0;
+    case 160: out_copy_h(c,ev_handle(am_appfn_event(&g_appfn_health_warning,"appfn health warning"))); return 0;
+    case 210: out_copy_h(c,ev_handle(am_appfn_event(&g_appfn_opmode_refresh,"appfn operation mode refresh"))); return 0;
+    case 321: return 0;                                                 /* Switch 2 SDK extension */
     case 141: return RC(128,2);
     case 170: out8(c,0); return 0;
   }
